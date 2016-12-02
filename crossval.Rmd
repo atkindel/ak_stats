@@ -1,0 +1,293 @@
+---
+title: "Prediction and cross validation"
+author: "Alex Kindel"
+date: "1 December 2016"
+output: 
+  beamer_presentation:
+    theme: "Boadilla"
+    colortheme: "dolphin"
+    slide_level: 2
+    fig_height: 6
+header-includes:
+- \subtitle{Soc Stats Reading Group}
+- \institute{Princeton University}
+- \usepackage{graphicx}
+- \graphicspath{ {resources/images/} }
+- \usepackage{color}
+---
+
+```{r setup, include=FALSE}
+require(sqldf)
+require(dplyr)
+require(knitr)
+require(reshape)
+require(magrittr)
+require(stargazer)
+require(functional)
+require(Hmisc)
+
+lm.table <- Curry(stargazer,
+                  style="asr",
+                  report="vc*s",
+                  table.layout="-d-!#c-t-s=n",
+                  notes.label="\\textit{Note: }",
+                  intercept.bottom=FALSE,
+                  header=FALSE)
+```
+
+```{r 1, echo=FALSE}
+# Load data
+setwd("~/Princeton/fall16/miscellaneous/srg_12.1/resources/wgb/Data")
+load("fl.three.RData")
+fl <- fl.three
+rm(fl.three)
+load("ch.RData")
+```
+
+## Outline
+
+1. Civil war
+2. Cross validation
+3. Back to civil war
+4. Why care about prediction?
+
+## Ward, Greenhill & Bakke (2010)
+
+- "The perils of policy by p-value: Predicting civil conflicts." *Journal of Peace Research* 47(4), 363-75.
+- "...basing policy prescriptions on statistical summaries of probabilistic models (which are predictions) can lead to misleading policy prescriptions if out-of-sample predictive heuristics are ignored."
+    - In a word: overfitting
+    
+## Civil wars
+
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\includegraphics[width=6cm]{FearonLaitin}
+\end{column}
+\begin{column}{0.48\textwidth}
+\includegraphics[width=6cm]{CollierHoeffler}
+\end{column}
+\end{columns}
+
+- Based on logistic regression
+- Widely used to guide policy
+    - World Bank, House of Representatives
+    - *The New Yorker*, *The New York Times*, etc.
+
+## Civil wars
+
+- But: Strikingly poor performance on in-sample prediction
+
+\begin{center}
+\includegraphics[width=11cm]{prediction}
+\end{center}
+
+
+## Cross validation
+
+\begin{center}
+\includegraphics[width=6cm]{socv}
+\end{center}
+
+
+## Procedure
+
+1. Split data into *k* "folds" (equally sized groups)
+2. Withholding one fold, re-estimate model
+3. Test predictive power of model on withheld group (AUC)
+
+
+## Receiver operating characteristic (ROC) curve
+
+\begin{center}
+\includegraphics[width=6cm]{rocs}
+\end{center}
+
+- We use area under the ROC curve (AUC) as a heuristic measure of predictiveness
+    - Intuitively, increasing AUC implies TPR > FPR
+- (From the people who brought you instructional television...)
+
+
+## Tricks and missteps
+
+- Bias-variance tradeoff
+    - k = n (LOOCV): higher variance (low variance among training sets), but lower bias
+    - k < n (*k*-fold): lower variance, but higher bias (*overestimating* prediction error)
+- General consensus is that it might be better to overestimate prediction error (conservative bias)
+    - Also, LOOCV is "more expensive"
+- **Don't do (supervised) feature selection before model validation!**
+    - Will overestimate AUC (drastically)
+
+
+## Cross validation: pretty easy to implement!
+
+\tiny
+```{r 2}
+# Function to divide data into folds randomly
+fold <- function(data, k) {
+  data <- data[sample(nrow(data)),]  # Shuffle data
+  data %<>% mutate(fold = cut(seq(1:nrow(data)), breaks = k, labels=FALSE))
+  return(data)
+}
+
+# Function to cross-validate data on given model (curried)
+cv.predict.logit <- function(data, dv, model.fx, k) {
+  data %<>% fold(k)  # Fold data
+  aucs <- c()
+  for(i in 1:k) {
+    # Divide data into train and test sets
+    train <- data %>% filter(fold != i)
+    test <- data %>% filter(fold == i)
+    
+    # Estimate model on training data
+    mx <- model.fx(data=train)
+    
+    # Predict on test data and calculate AUC
+    preds <- predict(mx, newdata=test, type="response")
+    AUC <- somers2(preds, test[[dv]])[1]
+    aucs[i] <- AUC
+  }
+  return(mean(aucs, na.rm=TRUE))  # Yield mean AUC
+}
+
+# Function to rerun CV results n times and average AUCs
+crossval <- function(data, dv, model.fx, k, n) {
+  aucs <- replicate(n, cv.predict.logit(data, dv, model.fx, k))
+  return(aucs)
+}
+```
+
+
+## Back to civil war
+
+\small
+```{r 3, warning=FALSE}
+# Define Collier & Hoeffler model
+ch.form <- as.factor(warsa) ~ sxp + sxp2 + secm + gy1 + peace + geogia + lnpop + frac +  etdo4590
+ch.mx <- Curry(glm, formula=ch.form, family=binomial(link=logit))
+
+# Define Fearon & Laitin model
+fl.form <- as.factor(onset) ~ warl + gdpenl + lpopl1 + lmtnest + ncontig + Oil + nwstate + instab + polity2l + ethfrac + relfrac
+fl.mx <- Curry(glm, formula=fl.form, family=binomial(link=logit))
+
+# Perform cross-validation
+k <- 4  # Set k folds
+ch.auc <- cv.predict.logit(ch, "warsa", ch.mx, k)
+fl.auc <- cv.predict.logit(fl, "onset", fl.mx, k)
+
+c(ch.auc, fl.auc)
+```
+
+
+## Calculating a stable AUC
+
+- Sensitive to dataset randomization during "folding"
+    - Not too much to worry about here (usually)
+- Sensitive to choice of *k*
+    - Low k: upward bias in AUC
+    - High k: higher variance in AUC
+
+
+## Sensitivity to randomization: F&L
+
+\small
+```{r 4, warning=FALSE}
+k <- 4
+n <- 200  # Set n CV cycles
+ch.aucs <- crossval(ch, "warsa", ch.mx, k, n)
+```
+
+\normalsize
+```{r 5, echo=FALSE, warning=FALSE, fig.width=4, fig.height=2}
+data.frame(auc = ch.aucs) %>%
+  ggplot(aes(x=auc)) + 
+  geom_density() + 
+  geom_vline(xintercept=ch.auc, color="blue", linetype="dashed") + 
+  geom_vline(xintercept=mean(ch.aucs), color="red")
+```
+
+- \color{red}mean over N cycles
+- \color{blue}AUC in first cycle
+
+## Sensitivity to randomization: C&H
+
+\small
+```{r 6, warning=FALSE}
+k <- 4
+n <- 200  # Set n CV cycles
+fl.aucs <- crossval(fl, "onset", fl.mx, k, n)
+```
+
+\normalsize
+```{r 7, echo=FALSE, warning=FALSE, fig.width=4, fig.height=2}
+data.frame(auc = fl.aucs) %>%
+  ggplot(aes(x=auc)) + 
+  geom_density() + 
+  geom_vline(xintercept=fl.auc, color="blue", linetype="dashed") +
+  geom_vline(xintercept=mean(fl.aucs), color="red")
+```
+
+- \color{red}mean over N cycles
+- \color{blue}AUC in first cycle
+
+## Sensitivity to choice of *k*: F&L
+
+\small
+```{r 8, warning=FALSE}
+n <- 100
+list(k4 = crossval(fl, "onset", fl.mx, 4, n),
+     k10 = crossval(fl, "onset", fl.mx, 10, n),
+     k20 = crossval(fl, "onset", fl.mx, 20, n),
+     k100 = crossval(fl, "onset", fl.mx, 100, n),
+     k500 = crossval(fl, "onset", fl.mx, 500, n)) ->
+  fl.aucs.ks
+```
+
+## Sensitivity to choice of *k*: F&L
+
+```{r 9, echo=FALSE, warning=FALSE, fig.width=4, fig.height=3}
+as.data.frame(fl.aucs.ks) %>%
+  melt() %>%
+  group_by(variable) %>%
+  dplyr::summarize(m = mean(value)) ->
+  fak.means
+as.data.frame(fl.aucs.ks) %>%
+  melt() %>%
+  ggplot(aes(x=value, color=variable)) +
+  geom_density() +
+  geom_vline(xintercept=mean(fak.means$m), linetype="dashed")
+```
+
+## Sensitivity to choice of *k*: C&H
+
+\small
+```{r 10, eval=FALSE, warning=FALSE}
+n <- 100
+list(k4 = crossval(ch, "warsa", ch.mx, 4, n),
+     k10 = crossval(ch, "warsa", ch.mx, 10, n),
+     k20 = crossval(ch, "warsa", ch.mx, 20, n),
+     k100 = crossval(ch, "warsa", ch.mx, 100, n)) ->
+  ch.aucs.ks
+```
+
+## Sensitivity to choice of *k*: C&H
+
+```{r 11, echo=FALSE, warning=FALSE, fig.width=4, fig.height=3}
+as.data.frame(ch.aucs.ks) %>%
+  melt() %>%
+  group_by(variable) %>%
+  dplyr::summarize(m = mean(value)) ->
+  cak.means
+as.data.frame(ch.aucs.ks) %>%
+  melt() %>%
+  ggplot(aes(x=value, color=variable)) +
+  geom_density() +
+  geom_vline(xintercept=mean(cak.means$m), linetype="dashed")
+```
+
+## Conclusion: why might we care?
+
+- Technical tradeoff between variable significance vs. model predictiveness (Ward et al. 2010; Lo et al. 2015)
+- If we really think our models explain causal effects, shouldn't they be predictive? (Watts 2014)
+    - Especially if we're basing policy on our findings
+- Distinguishing origins from effects (Sewell 1996; Pierson 2000; Clemens 2007)
+
